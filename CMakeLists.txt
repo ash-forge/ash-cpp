@@ -44,6 +44,9 @@ add_executable(model_test
     src/model_test.cpp
     src/logger.cpp
     src/model_loader.cpp
+    src/gguf_parser.cpp
+    src/tensor.cpp
+    src/memory_lock.cpp
 )
 
 # Emotional state test executable
@@ -78,7 +81,16 @@ target_include_directories(memory_test PRIVATE
 
 # Threading support
 find_package(Threads REQUIRED)
-target_link_libraries(ash_engine PRIVATE Threads::Threads sqlite3)
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found — parallelizing matmul/matvec")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+    set(OMP_LIBS OpenMP::OpenMP_CXX)
+else()
+    message(STATUS "OpenMP NOT found — single-threaded matmul")
+    set(OMP_LIBS "")
+endif()
+target_link_libraries(ash_engine PRIVATE Threads::Threads sqlite3 ${OMP_LIBS})
 target_link_libraries(model_test PRIVATE Threads::Threads)
 target_link_libraries(emotional_test PRIVATE Threads::Threads)
 # Decision test executable
@@ -128,7 +140,7 @@ add_executable(matrix_ops_test
 target_include_directories(matrix_ops_test PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(matrix_ops_test PRIVATE Threads::Threads)
+target_link_libraries(matrix_ops_test PRIVATE Threads::Threads ${OMP_LIBS})
 
 # GGUF parser test executable
 add_executable(gguf_parser_test
@@ -178,6 +190,7 @@ add_executable(inference_test
     src/tensor.cpp
     src/matrix_ops.cpp
     src/gguf_parser.cpp
+    src/safetensors_parser.cpp
     src/tokenizer.cpp
     src/attention.cpp
     src/inference.cpp
@@ -186,7 +199,7 @@ add_executable(inference_test
 target_include_directories(inference_test PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(inference_test PRIVATE Threads::Threads)
+target_link_libraries(inference_test PRIVATE Threads::Threads ${OMP_LIBS})
 
 # Persona test executable
 add_executable(persona_test
@@ -239,13 +252,16 @@ add_executable(ash_cli
 target_include_directories(ash_cli PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(ash_cli PRIVATE Threads::Threads sqlite3)
+target_link_libraries(ash_cli PRIVATE Threads::Threads sqlite3 ${OMP_LIBS})
 
 # Multi-Model Test - Ash-Forge routing system
 add_executable(multimodel_test
     src/multimodel_test.cpp
     src/model_loader.cpp
     src/scout_agent.cpp
+    src/gguf_parser.cpp
+    src/tensor.cpp
+    src/memory_lock.cpp
     src/logger.cpp
 )
 
@@ -274,7 +290,7 @@ add_executable(test_gen
     src/logger.cpp
 )
 target_include_directories(test_gen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(test_gen sqlite3)
+target_link_libraries(test_gen sqlite3 ${OMP_LIBS})
 
 # Test vocab/tokenizer
 add_executable(test_vocab
@@ -513,7 +529,7 @@ add_executable(test_gen_fast
     src/logger.cpp
 )
 target_include_directories(test_gen_fast PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(test_gen_fast sqlite3)
+target_link_libraries(test_gen_fast sqlite3 ${OMP_LIBS})
 
 # Test with reference token IDs (bypass tokenizer)
 add_executable(test_reference_tokens
@@ -528,12 +544,14 @@ add_executable(test_reference_tokens
     src/logger.cpp
 )
 target_include_directories(test_reference_tokens PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(test_reference_tokens sqlite3)
+target_link_libraries(test_reference_tokens sqlite3 ${OMP_LIBS})
 
 # KV cache parity test
 add_executable(test_kv_parity
     test_kv_parity.cpp
     src/inference.cpp
+    src/inference_safetensors.cpp
+    src/safetensors_parser.cpp
     src/tensor.cpp
     src/matrix_ops.cpp
     src/gguf_parser.cpp
@@ -543,7 +561,7 @@ add_executable(test_kv_parity
     src/logger.cpp
 )
 target_include_directories(test_kv_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(test_kv_parity sqlite3)
+target_link_libraries(test_kv_parity sqlite3 ${OMP_LIBS})
 
 # SafeTensors test executable
 add_executable(test_safetensors
@@ -562,12 +580,18 @@ add_executable(test_inference_safetensors
     src/test_inference_safetensors.cpp
     src/logger.cpp
     src/tensor.cpp
+    src/matrix_ops.cpp
     src/memory_lock.cpp
     src/safetensors_parser.cpp
+    src/gguf_parser.cpp
+    src/tokenizer.cpp
+    src/attention.cpp
+    src/inference.cpp
+    src/inference_safetensors.cpp
 )
 
 target_include_directories(test_inference_safetensors PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(test_inference_safetensors PRIVATE Threads::Threads)
+target_link_libraries(test_inference_safetensors PRIVATE Threads::Threads sqlite3 ${OMP_LIBS})
 
 # Set compile definitions for release builds
 # target_compile_definitions(test_gen_fast PRIVATE NO_DEBUG_OUTPUT)  # Disabled - not currently used

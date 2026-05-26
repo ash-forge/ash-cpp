@@ -6,6 +6,9 @@
 #include <stdexcept>
 #include <sstream>
 #include <iomanip>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace ash {
 
@@ -48,7 +51,8 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     Tensor c = Tensor::zeros({m, n}, DType::F32);
     float* c_data = c.data_f32();
     
-    // Naive implementation (TODO: optimize with blocking, SIMD, etc.)
+    // Naive implementation, parallelized over rows×cols via OpenMP
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int64_t i = 0; i < m; ++i) {
         for (int64_t j = 0; j < n; ++j) {
             float sum = 0.0f;
@@ -104,6 +108,8 @@ Tensor matmul_transposed(const Tensor& a, const Tensor& b, bool transpose_a, boo
     if (!transpose_a && transpose_b) {
         // Most common case: A @ B^T
         // A: [m, k], B: [n, k] -> C: [m, n]
+        // collapse(2) parallelizes across both i and j — critical for m=1 (generation)
+        #pragma omp parallel for collapse(2) schedule(static)
         for (int64_t i = 0; i < m; ++i) {
             for (int64_t j = 0; j < n; ++j) {
                 float sum = 0.0f;
@@ -117,6 +123,7 @@ Tensor matmul_transposed(const Tensor& a, const Tensor& b, bool transpose_a, boo
     } else if (transpose_a && !transpose_b) {
         // A^T @ B
         // A: [k, m], B: [k, n] -> C: [m, n]
+        #pragma omp parallel for collapse(2) schedule(static)
         for (int64_t i = 0; i < m; ++i) {
             for (int64_t j = 0; j < n; ++j) {
                 float sum = 0.0f;
@@ -130,6 +137,7 @@ Tensor matmul_transposed(const Tensor& a, const Tensor& b, bool transpose_a, boo
     } else if (transpose_a && transpose_b) {
         // A^T @ B^T
         // A: [k, m], B: [n, k] -> C: [m, n]
+        #pragma omp parallel for collapse(2) schedule(static)
         for (int64_t i = 0; i < m; ++i) {
             for (int64_t j = 0; j < n; ++j) {
                 float sum = 0.0f;
@@ -173,6 +181,7 @@ Tensor matvec(const Tensor& a, const Tensor& x) {
     Tensor y = Tensor::zeros({m}, DType::F32);
     float* y_data = y.data_f32();
     
+    #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < m; ++i) {
         float sum = 0.0f;
         for (int64_t j = 0; j < k; ++j) {
