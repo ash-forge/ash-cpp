@@ -11,10 +11,11 @@ namespace ash {
 enum class DType {
     F32,    // 32-bit float
     F16,    // 16-bit float
-    Q8_0,   // 8-bit quantized
-    Q4_K,   // 4-bit quantized (K-quants)
-    Q5_K,   // 5-bit quantized
-    Q6_K,   // 6-bit quantized
+    Q8_0,   // 8-bit quantized (legacy GGUF, 32-elem blocks)
+    Q4_0,   // 4-bit quantized (legacy GGUF, 32-elem blocks)
+    Q4_K,   // 4-bit quantized (K-quants, 256-elem blocks)
+    Q5_K,   // 5-bit quantized (K-quants, 256-elem blocks)
+    Q6_K,   // 6-bit quantized (K-quants, 256-elem blocks)
     I32,    // 32-bit int
     I16,    // 16-bit int
     I8      // 8-bit int
@@ -121,6 +122,7 @@ const char* dtype_name(DType dtype);
 
 // Dequantization functions (quantized → F32)
 void dequantize_q8_0(const void* src, float* dst, int64_t n);
+void dequantize_q4_0(const void* src, float* dst, int64_t n);
 void dequantize_q4_k(const void* src, float* dst, int64_t n);
 void dequantize_q5_k(const void* src, float* dst, int64_t n);
 void dequantize_q6_k(const void* src, float* dst, int64_t n);

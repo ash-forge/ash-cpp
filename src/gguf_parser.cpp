@@ -13,6 +13,7 @@ DType gguf_type_to_dtype(GGUFTensorType gguf_type) {
     switch (gguf_type) {
         case GGUFTensorType::F32: return DType::F32;
         case GGUFTensorType::F16: return DType::F16;
+        case GGUFTensorType::Q4_0: return DType::Q4_0;
         case GGUFTensorType::Q8_0: return DType::Q8_0;
         case GGUFTensorType::Q4_K: return DType::Q4_K;
         case GGUFTensorType::Q5_K: return DType::Q5_K;
@@ -28,6 +29,60 @@ DType gguf_type_to_dtype(GGUFTensorType gguf_type) {
 
 GGUFParser::GGUFParser() = default;
 GGUFParser::~GGUFParser() = default;
+
+// Maximum array elements to store — anything larger (e.g. vocabulary lists) is skipped
+static constexpr uint64_t MAX_STORED_ARRAY = 4096;
+
+// Returns element byte width for fixed-width GGUF types, 0 for variable-width
+static size_t fixed_element_size(GGUFMetadataType type) {
+    switch (type) {
+        case GGUFMetadataType::UINT8:  case GGUFMetadataType::INT8:  case GGUFMetadataType::BOOL:   return 1;
+        case GGUFMetadataType::UINT16: case GGUFMetadataType::INT16:                                 return 2;
+        case GGUFMetadataType::UINT32: case GGUFMetadataType::INT32: case GGUFMetadataType::FLOAT32: return 4;
+        case GGUFMetadataType::UINT64: case GGUFMetadataType::INT64: case GGUFMetadataType::FLOAT64: return 8;
+        default: return 0; // STRING or ARRAY — variable width
+    }
+}
+
+// Advance file position past one metadata value without storing it
+static void skip_bytes(std::ifstream& file, uint64_t n) {
+    static char discard[65536];
+    while (n > 0) {
+        size_t chunk = (n < sizeof(discard)) ? (size_t)n : sizeof(discard);
+        file.read(discard, chunk);
+        n -= chunk;
+    }
+}
+
+static void skip_metadata_value(std::ifstream& file, GGUFMetadataType type) {
+    size_t fixed = fixed_element_size(type);
+    if (fixed > 0) {
+        skip_bytes(file, fixed);
+        return;
+    }
+    switch (type) {
+        case GGUFMetadataType::STRING: {
+            uint64_t len;
+            file.read(reinterpret_cast<char*>(&len), 8);
+            if (len < 8 * 1024 * 1024) skip_bytes(file, len);
+            break;
+        }
+        case GGUFMetadataType::ARRAY: {
+            uint32_t arr_type; uint64_t arr_len;
+            file.read(reinterpret_cast<char*>(&arr_type), 4);
+            file.read(reinterpret_cast<char*>(&arr_len), 8);
+            size_t elem_size = fixed_element_size(static_cast<GGUFMetadataType>(arr_type));
+            if (elem_size > 0) {
+                skip_bytes(file, arr_len * elem_size); // Single sequential read for fixed-width arrays
+            } else {
+                for (uint64_t i = 0; i < arr_len; ++i)
+                    skip_metadata_value(file, static_cast<GGUFMetadataType>(arr_type));
+            }
+            break;
+        }
+        default: break;
+    }
+}
 
 std::string GGUFParser::read_string(std::ifstream& file) {
     uint64_t len;
@@ -115,11 +170,23 @@ bool GGUFParser::read_metadata_value(std::ifstream& file, GGUFMetadataType type,
             uint64_t array_len;
             file.read(reinterpret_cast<char*>(&array_type), 4);
             file.read(reinterpret_cast<char*>(&array_len), 8);
-            
-            out.array_value.resize(array_len);
-            for (uint64_t i = 0; i < array_len; ++i) {
-                if (!read_metadata_value(file, static_cast<GGUFMetadataType>(array_type), out.array_value[i])) {
-                    return false;
+
+            if (array_len > MAX_STORED_ARRAY) {
+                // Skip large arrays (e.g. 152K-entry tokenizer vocab) efficiently
+                size_t elem_size = fixed_element_size(static_cast<GGUFMetadataType>(array_type));
+                if (elem_size > 0) {
+                    file.seekg(array_len * elem_size, std::ios::cur);
+                } else {
+                    for (uint64_t i = 0; i < array_len; ++i)
+                        skip_metadata_value(file, static_cast<GGUFMetadataType>(array_type));
+                }
+                out.array_value.clear();
+            } else {
+                out.array_value.resize(array_len);
+                for (uint64_t i = 0; i < array_len; ++i) {
+                    if (!read_metadata_value(file, static_cast<GGUFMetadataType>(array_type), out.array_value[i])) {
+                        return false;
+                    }
                 }
             }
             break;
@@ -141,6 +208,11 @@ bool GGUFParser::parse(const std::string& file_path) {
         Logger::instance().error("Failed to open GGUF file: " + file_path);
         return false;
     }
+
+    // Use a large read buffer so metadata parsing doesn't hammer the OS
+    // with thousands of tiny syscalls (default buffer is only ~512 bytes on Windows)
+    static thread_local std::vector<char> read_buf(2 * 1024 * 1024); // 2 MB
+    file.rdbuf()->pubsetbuf(read_buf.data(), read_buf.size());
     
     // Read header
     uint32_t magic;
