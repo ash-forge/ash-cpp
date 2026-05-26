@@ -26,6 +26,10 @@ bool InferenceEngine::load_model(const std::string& gguf_path) {
     
     // Extract model config from parser
     config_.architecture = parser.get_architecture();
+    if (config_.architecture.empty()) {
+        Logger::instance().error("GGUF: general.architecture missing — cannot load model");
+        return false;
+    }
     config_.vocab_size = parser.get_vocab_size();
     config_.hidden_dim = parser.get_embedding_dim();
     config_.n_layers = parser.get_num_layers();
@@ -33,27 +37,62 @@ bool InferenceEngine::load_model(const std::string& gguf_path) {
     config_.n_kv_heads = parser.get_num_kv_heads();
     config_.max_seq_len = parser.get_context_length();
     
+    // Validate critical dimensions before proceeding
+    if (config_.hidden_dim == 0 || config_.n_layers == 0 || config_.n_heads == 0) {
+        Logger::instance().error("GGUF: critical model dimensions are zero — metadata may be malformed");
+        Logger::instance().error("  hidden_dim=" + std::to_string(config_.hidden_dim) +
+                                 " n_layers=" + std::to_string(config_.n_layers) +
+                                 " n_heads=" + std::to_string(config_.n_heads));
+        return false;
+    }
+    
     std::string prefix = config_.architecture + ".";
-    config_.intermediate_dim = parser.get_uint(prefix + "feed_forward_length", 8192);
+    config_.intermediate_dim = static_cast<int>(parser.get_uint(prefix + "feed_forward_length", 0));
+    if (config_.intermediate_dim == 0) {
+        // Fallback: SwiGLU FFN is typically ~8/3 × hidden_dim (rounded up to multiple of 256)
+        config_.intermediate_dim = ((config_.hidden_dim * 8 / 3) + 255) & ~255;
+        Logger::instance().warning("GGUF: feed_forward_length missing, estimating as " +
+                                   std::to_string(config_.intermediate_dim));
+    }
     
-    // Default theta depends on architecture
-    float default_theta = (config_.architecture == "qwen2") ? 1000000.0f : 10000.0f;
-    config_.rope_theta = parser.get_float(prefix + "rope.freq_base", default_theta);
+    // rope_theta: check arch-specific key, then apply sensible architecture defaults
+    config_.rope_theta = parser.get_float(prefix + "rope.freq_base", 0.0f);
+    if (config_.rope_theta == 0.0f) {
+        if (config_.architecture == "qwen2" || config_.architecture == "qwen3") {
+            config_.rope_theta = 1000000.0f;
+        } else if (config_.architecture == "llama" || config_.architecture == "mistral") {
+            config_.rope_theta = 500000.0f;  // Llama3+ default
+        } else {
+            config_.rope_theta = 10000.0f;   // Classic RoPE default (Llama2, Gemma)
+        }
+        Logger::instance().warning("GGUF: rope.freq_base missing, using default " +
+                                   std::to_string(config_.rope_theta));
+    }
     
-    config_.rms_norm_eps = parser.get_float(prefix + "attention.layer_norm_rms_epsilon", 1e-6f);
-    if (config_.rms_norm_eps == 0) config_.rms_norm_eps = 1e-6f; // Sanity check
+    config_.rms_norm_eps = parser.get_float(prefix + "attention.layer_norm_rms_epsilon", 0.0f);
+    if (config_.rms_norm_eps == 0.0f) {
+        config_.rms_norm_eps = 1e-5f;  // Llama/Mistral use 1e-5; Gemma uses 1e-6 (re-specified in file)
+    }
     
-    config_.head_dim = config_.hidden_dim / config_.n_heads;
+    // head_dim: use explicit value if provided (Gemma, Phi-3 set attention.key_length)
+    uint64_t explicit_head_dim = parser.get_uint(prefix + "attention.key_length", 0);
+    config_.head_dim = explicit_head_dim > 0
+        ? static_cast<int>(explicit_head_dim)
+        : config_.hidden_dim / config_.n_heads;
     
     // Debug config values
     Logger::instance().info("Model config loaded:");
+    Logger::instance().info("  arch=" + config_.architecture);
     Logger::instance().info("  n_layers=" + std::to_string(config_.n_layers));
     Logger::instance().info("  n_heads=" + std::to_string(config_.n_heads));
     Logger::instance().info("  n_kv_heads=" + std::to_string(config_.n_kv_heads));
     Logger::instance().info("  hidden_dim=" + std::to_string(config_.hidden_dim));
+    Logger::instance().info("  intermediate_dim=" + std::to_string(config_.intermediate_dim));
     Logger::instance().info("  head_dim=" + std::to_string(config_.head_dim));
     Logger::instance().info("  max_seq_len=" + std::to_string(config_.max_seq_len));
+    Logger::instance().info("  vocab_size=" + std::to_string(config_.vocab_size));
     Logger::instance().info("  rope_theta=" + std::to_string(config_.rope_theta));
+    Logger::instance().info("  rms_norm_eps=" + std::to_string(config_.rms_norm_eps));
     
     // Load weights
     if (!load_weights_from_gguf(parser)) {
@@ -190,25 +229,12 @@ Tensor InferenceEngine::forward(const std::vector<TokenID>& tokens, KVCache* kv_
     // Get token embeddings: [seq_len, hidden_dim]
     Tensor x = Tensor::empty({seq_len, config_.hidden_dim}, DType::F32);
     
-    // Check if we need embedding scaling (Gemma-specific)
-    // Testing WITHOUT scaling since Qwen2 shouldn't need it
     bool use_emb_scaling = (config_.architecture == "gemma");
     float emb_scale = use_emb_scaling ? std::sqrt(static_cast<float>(config_.hidden_dim)) : 1.0f;
     
-    // DEBUG: Print embedding scale
-    if (start_pos == 0 && seq_len == 3) {
-        std::cout << "\n=== EMBEDDING SETUP ===\n";
-        std::cout << "Architecture: " << config_.architecture << "\n";
-        std::cout << "use_emb_scaling: " << use_emb_scaling << "\n";
-        std::cout << "emb_scale: " << emb_scale << "\n";
-    }
-    
     for (int i = 0; i < seq_len; i++) {
-        // Copy embedding for token[i]
         const float* emb_data = weights_.token_embeddings.data_f32() + tokens[i] * config_.hidden_dim;
         float* x_data = x.data_f32() + i * config_.hidden_dim;
-        
-        // Scale embeddings if needed (Gemma requires sqrt(hidden_dim), Qwen doesn't)
         if (use_emb_scaling) {
             for (int d = 0; d < config_.hidden_dim; d++) {
                 x_data[d] = emb_data[d] * emb_scale;
@@ -216,143 +242,16 @@ Tensor InferenceEngine::forward(const std::vector<TokenID>& tokens, KVCache* kv_
         } else {
             std::memcpy(x_data, emb_data, config_.hidden_dim * sizeof(float));
         }
-        
-        // DEBUG: Print embedding L2 norm
-        if (start_pos == 0 && seq_len == 3) {
-            float norm = 0.0f;
-            for (int d = 0; d < config_.hidden_dim; d++) {
-                norm += x_data[d] * x_data[d];
-            }
-            norm = std::sqrt(norm);
-            std::cout << "Token " << tokens[i] << " embedding norm: " << norm 
-                      << ", first 10: [";
-            for (int d = 0; d < 10; d++) {
-                std::cout << x_data[d];
-                if (d < 9) std::cout << ", ";
-            }
-            std::cout << "]\n";
-        }
     }
     
-    // Forward through layers
-    // Pass start_pos so each token i gets absolute position start_pos + i
+    // Forward through all layers
     for (int layer_idx = 0; layer_idx < (int)config_.n_layers; layer_idx++) {
         x = forward_layer(x, weights_.layers[layer_idx], layer_idx, start_pos, kv_cache);
-        
-        // DEBUG: Track hidden state growth through layers
-        if (start_pos == 0 && seq_len == 3 && layer_idx <= 5) {
-            const float* x_data = x.data_f32();
-            float norm_pos2 = 0.0f;
-            for (int d = 0; d < config_.hidden_dim; d++) {
-                float val = x_data[2 * config_.hidden_dim + d];  // Position 2
-                norm_pos2 += val * val;
-            }
-            norm_pos2 = std::sqrt(norm_pos2);
-            std::cout << "After layer " << layer_idx << ", position 2 L2 norm: " << norm_pos2 << "\n";
-        }
-        
-        // DEBUG: Print layer 0 output norms
-        if (layer_idx == 0 && start_pos == 0 && seq_len == 3) {
-            std::cout << "\n=== LAYER 0 OUTPUT ===\n";
-            for (int i = 0; i < seq_len; i++) {
-                const float* x_data = x.data_f32() + i * config_.hidden_dim;
-                float norm = 0.0f;
-                for (int d = 0; d < config_.hidden_dim; d++) {
-                    norm += x_data[d] * x_data[d];
-                }
-                norm = std::sqrt(norm);
-                std::cout << "Position " << i << " norm: " << norm << ", first 10: [";
-                for (int d = 0; d < 10; d++) {
-                    std::cout << x_data[d];
-                    if (d < 9) std::cout << ", ";
-                }
-                std::cout << "]\n";
-            }
-        }
     }
     
-    // DEBUG: Print before final RMSNorm
-    if (start_pos == 0 && seq_len == 3) {
-        std::cout << "\n=== BEFORE FINAL RMSNORM ===\n";
-        const float* x_data = x.data_f32();
-        float norm_pos2 = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = x_data[2 * config_.hidden_dim + d];  // Position 2
-            norm_pos2 += val * val;
-        }
-        norm_pos2 = std::sqrt(norm_pos2);
-        std::cout << "Position 2 L2 norm: " << norm_pos2 << "\n";
-    }
-    
-    // Final RMSNorm
+    // Final RMSNorm + output projection
     x = rmsnorm(x, weights_.output_norm, config_.rms_norm_eps);
-    
-    // DEBUG: Check hidden state before output projection during generation
-    if (start_pos >= 10 && start_pos <= 15 && seq_len == 1) {
-        const float* x_data = x.data_f32();
-        float x_min = INFINITY, x_max = -INFINITY, x_sum = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = x_data[d];
-            x_min = std::min(x_min, val);
-            x_max = std::max(x_max, val);
-            x_sum += val;
-        }
-        std::cout << "\n=== HIDDEN STATE BEFORE OUTPUT PROJ @ POS " << start_pos << " ===\n";
-        std::cout << "Stats: min=" << x_min << ", max=" << x_max << ", mean=" << (x_sum / config_.hidden_dim) << "\n";
-        std::cout << "First 10 values: ";
-        for (int d = 0; d < 10; d++) {
-            std::cout << x_data[d] << " ";
-        }
-        std::cout << "\n";
-    }
-    
-    // DEBUG: Print after final RMSNorm
-    if (start_pos == 0 && seq_len == 3) {
-        std::cout << "\n=== AFTER FINAL RMSNORM ===\n";
-        const float* x_data = x.data_f32();
-        float norm_pos2 = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = x_data[2 * config_.hidden_dim + d];  // Position 2
-            norm_pos2 += val * val;
-        }
-        norm_pos2 = std::sqrt(norm_pos2);
-        std::cout << "Position 2 L2 norm: " << norm_pos2 << "\n";
-        
-        // Print output_norm weight stats
-        std::cout << "output_norm.weight L2: ";
-        const float* norm_weights = weights_.output_norm.data_f32();
-        float norm_l2 = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            norm_l2 += norm_weights[d] * norm_weights[d];
-        }
-        std::cout << std::sqrt(norm_l2) << "\n";
-    }
-    
-    // Output projection: [seq_len, hidden_dim] @ [vocab_size, hidden_dim]^T = [seq_len, vocab_size]
     Tensor logits = matmul_transposed(x, weights_.output, false, true);
-    
-    // DEBUG: Print logits at position 2
-    if (start_pos == 0 && seq_len == 3) {
-        std::cout << "\n=== LOGITS AT POSITION 2 ===\n";
-        const float* logits_data = logits.data_f32();
-        int vocab_size = config_.vocab_size;
-        
-        // Find top 5
-        std::vector<std::pair<float, int>> logit_pairs;
-        for (int v = 0; v < vocab_size; v++) {
-            logit_pairs.push_back({logits_data[2 * vocab_size + v], v});
-        }
-        std::sort(logit_pairs.begin(), logit_pairs.end(), std::greater<>());
-        
-        std::cout << "Top-5:\n";
-        for (int i = 0; i < 5; i++) {
-            std::cout << "  Token " << logit_pairs[i].second << ": " << logit_pairs[i].first << "\n";
-        }
-        
-        // Check specific tokens
-        std::cout << "Token 220: " << logits_data[2 * vocab_size + 220] << "\n";
-        std::cout << "Token 1124: " << logits_data[2 * vocab_size + 1124] << "\n";
-    }
     
     return logits;
 }
@@ -364,219 +263,21 @@ Tensor InferenceEngine::forward_layer(
     int pos,
     KVCache* kv_cache
 ) {
-    int seq_len = x.shape().dims[0];
-    
-    // DEBUG: Check input shape and VALUES during generation
-    if (layer_idx == 0 && pos >= 10 && pos <= 15) {
-        std::cout << "\n=== LAYER 0 INPUT @ POS " << pos << " ===\n";
-        std::cout << "x shape: [" << x.shape().dims[0] << ", " << x.shape().dims[1] << "]\n";
-        std::cout << "seq_len=" << seq_len << ", pos=" << pos << "\n";
-        
-        // CRITICAL: Check KV cache size to see if it's growing!
-        if (kv_cache) {
-            std::cout << "KV cache seq_len: " << kv_cache->seq_len() << "\n";
-        } else {
-            std::cout << "KV cache: nullptr\n";
-        }
-        
-        // Print first 10 values (this should be the token embedding)
-        const float* x_data = x.data_f32();
-        std::cout << "First 10 embedding values: ";
-        for (int i = 0; i < 10; ++i) {
-            std::cout << x_data[i] << " ";
-        }
-        std::cout << "\n";
-    }
-    
-    // DEBUG: Print layer 0 attn_norm weights
-    if (layer_idx == 0 && pos == 0 && seq_len == 3) {
-        const float* norm_weights = layer.attn_norm.data_f32();
-        float norm = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            norm += norm_weights[d] * norm_weights[d];
-        }
-        norm = std::sqrt(norm);
-        std::cout << "\n=== LAYER 0 ATTN_NORM WEIGHTS ===\n";
-        std::cout << "L2 norm: " << norm << ", first 10: [";
-        for (int d = 0; d < 10; d++) {
-            std::cout << norm_weights[d];
-            if (d < 9) std::cout << ", ";
-        }
-        std::cout << "]\n";
-    }
-    
-    // Pre-attention RMSNorm
+    // Pre-attention RMSNorm + attention + residual
     Tensor x_norm = rmsnorm(x, layer.attn_norm, config_.rms_norm_eps);
-    
-    // DEBUG: Layer 1 input
-    if (layer_idx == 1 && pos == 0 && seq_len == 3) {
-        std::cout << "\n=== LAYER 1 INPUT ===\n";
-        const float* x_data = x.data_f32();
-        float norm = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = x_data[2 * config_.hidden_dim + d];
-            norm += val * val;
-        }
-        std::cout << "Position 2 L2 norm: " << std::sqrt(norm) << "\n";
-    }
-    
-    // Attention (projects Q,K,V internally)
     Tensor attn_out = attention_->forward(
-        x_norm, 
+        x_norm,
         layer.wq, layer.wk, layer.wv, layer.wo,
-        layer.bq, layer.bk, layer.bv,  // Add biases
-        layer_idx,
-        pos,
-        kv_cache
+        layer.bq, layer.bk, layer.bv,
+        layer_idx, pos, kv_cache
     );
-    
-    // DEBUG: Layer 1 attention output
-    if (layer_idx == 1 && pos == 0 && seq_len == 3) {
-        std::cout << "\n=== LAYER 1 ATTENTION OUTPUT ===\n";
-        const float* attn_data = attn_out.data_f32();
-        float norm = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = attn_data[2 * config_.hidden_dim + d];
-            norm += val * val;
-        }
-        std::cout << "Position 2 L2 norm: " << std::sqrt(norm) << "\n";
-    }
-    
-    // DEBUG: Print attention output for layer 0
-    if (layer_idx == 0 && pos == 0 && seq_len == 3) {
-        std::cout << "\n=== LAYER 0 ATTENTION OUTPUT ===\n";
-        for (int i = 0; i < seq_len; i++) {
-            const float* attn_data = attn_out.data_f32() + i * config_.hidden_dim;
-            float norm = 0.0f;
-            for (int d = 0; d < config_.hidden_dim; d++) {
-                norm += attn_data[d] * attn_data[d];
-            }
-            norm = std::sqrt(norm);
-            std::cout << "Position " << i << " norm: " << norm << "\n";
-        }
-    }
-    
-    // Residual connection
     Tensor x_attn = add(x, attn_out);
     
-    // DEBUG: Compare x_attn at layer 0 during generation
-    if (layer_idx == 0 && pos >= 10 && pos <= 15 && seq_len == 1) {
-        const float* x_attn_data = x_attn.data_f32();
-        float x_attn_min = INFINITY, x_attn_max = -INFINITY, x_attn_sum = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = x_attn_data[d];
-            x_attn_min = std::min(x_attn_min, val);
-            x_attn_max = std::max(x_attn_max, val);
-            x_attn_sum += val;
-        }
-        std::cout << "\n=== LAYER 0 X_ATTN @ POS " << pos << " (after residual) ===\n";
-        std::cout << "Stats: min=" << x_attn_min << ", max=" << x_attn_max << ", mean=" << (x_attn_sum / config_.hidden_dim) << "\n";
-        std::cout << "First 5 values: ";
-        for (int d = 0; d < 5; d++) {
-            std::cout << x_attn_data[d] << " ";
-        }
-        std::cout << "\n";
-    }
-    
-    // DEBUG: Print x_attn (before RMSNorm) for layer 0
-    if (layer_idx == 0 && pos == 0 && seq_len == 3) {
-        std::cout << "\n=== LAYER 0 X_ATTN (before RMSNorm) ===\n";
-        for (int i = 0; i < seq_len; i++) {
-            const float* x_attn_data = x_attn.data_f32() + i * config_.hidden_dim;
-            float norm = 0.0f;
-            for (int d = 0; d < config_.hidden_dim; d++) {
-                norm += x_attn_data[d] * x_attn_data[d];
-            }
-            norm = std::sqrt(norm);
-            std::cout << "Position " << i << " norm: " << norm << "\n";
-        }
-    }
-    
-    // Pre-FFN RMSNorm
+    // Pre-FFN RMSNorm + FFN + residual
     Tensor x_attn_norm = rmsnorm(x_attn, layer.ffn_norm, config_.rms_norm_eps);
-    
-    // DEBUG: Check ffn_norm weights for layer 0 and 1
-    if ((layer_idx == 0 || layer_idx == 1) && pos == 0 && seq_len == 3) {
-        const float* norm_weights = layer.ffn_norm.data_f32();
-        float norm_weight_l2 = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            norm_weight_l2 += norm_weights[d] * norm_weights[d];
-        }
-        std::cout << "\n=== LAYER " << layer_idx << " FFN_NORM WEIGHT ===\n";
-        std::cout << "L2 norm: " << std::sqrt(norm_weight_l2) << "\n";
-        std::cout << "First 10 values: ";
-        for (int d = 0; d < 10; d++) {
-            std::cout << norm_weights[d];
-            if (d < 9) std::cout << ", ";
-        }
-        std::cout << "\n";
-    }
-    
-    // DEBUG: Layer 1 FFN input (after RMSNorm)
-    if (layer_idx == 1 && pos == 0 && seq_len == 3) {
-        std::cout << "\n=== LAYER 1 FFN INPUT (x_attn_norm) ===\n";
-        const float* norm_data = x_attn_norm.data_f32();
-        float norm = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = norm_data[2 * config_.hidden_dim + d];
-            norm += val * val;
-        }
-        std::cout << "Position 2 L2 norm: " << std::sqrt(norm) << "\n";
-        
-        // Also print x_attn (before RMSNorm)
-        const float* x_attn_data = x_attn.data_f32();
-        float x_attn_norm_val = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = x_attn_data[2 * config_.hidden_dim + d];
-            x_attn_norm_val += val * val;
-        }
-        std::cout << "x_attn (before RMSNorm) L2 norm: " << std::sqrt(x_attn_norm_val) << "\n";
-    }
-    
-    // FFN with residual
     Tensor ffn_out = forward_ffn(x_attn_norm, layer);
     
-    // DEBUG: FFN output at layer 0 during generation
-    if (layer_idx == 0 && pos == 10 && seq_len == 1) {
-        const float* ffn_data = ffn_out.data_f32();
-        float ffn_min = INFINITY, ffn_max = -INFINITY, ffn_sum = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = ffn_data[d];
-            ffn_min = std::min(ffn_min, val);
-            ffn_max = std::max(ffn_max, val);
-            ffn_sum += val;
-        }
-        std::cout << "=== LAYER 0 FFN_OUT @ POS 10 ===\n";
-        std::cout << "Stats: min=" << ffn_min << ", max=" << ffn_max << ", mean=" << (ffn_sum / config_.hidden_dim) << "\n";
-    }
-    
-    // DEBUG: Layer 1 FFN output
-    if (layer_idx == 1 && pos == 0 && seq_len == 3) {
-        std::cout << "\n=== LAYER 1 FFN OUTPUT ===\n";
-        const float* ffn_data = ffn_out.data_f32();
-        float norm = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = ffn_data[2 * config_.hidden_dim + d];
-            norm += val * val;
-        }
-        std::cout << "Position 2 L2 norm: " << std::sqrt(norm) << "\n";
-    }
-    
-    Tensor x_out = add(x_attn, ffn_out);
-    
-    // DEBUG: Layer 1 final output
-    if (layer_idx == 1 && pos == 0 && seq_len == 3) {
-        std::cout << "\n=== LAYER 1 FINAL OUTPUT ===\n";
-        const float* out_data = x_out.data_f32();
-        float norm = 0.0f;
-        for (int d = 0; d < config_.hidden_dim; d++) {
-            float val = out_data[2 * config_.hidden_dim + d];
-            norm += val * val;
-        }
-        std::cout << "Position 2 L2 norm: " << std::sqrt(norm) << "\n";
-    }
-    
-    return x_out;
+    return add(x_attn, ffn_out);
 }
 
 Tensor InferenceEngine::forward_ffn(const Tensor& x, const LayerWeights& layer) {
@@ -644,6 +345,8 @@ GenerationResult InferenceEngine::generate(
     const float* logits_data = logits.data_f32() + (seq_len - 1) * vocab_size;
     std::memcpy(last_logits.data_f32(), logits_data, vocab_size * sizeof(float));
     
+    inference_utils::apply_repetition_penalty(last_logits, tokens,
+        effective_sampling.repetition_penalty, effective_sampling.repetition_penalty_range);
     TokenID next_token = sample_token(last_logits, effective_sampling);
     
     std::cout << "." << std::flush;
@@ -691,6 +394,18 @@ GenerationResult InferenceEngine::generate(
     
     // Decode only generated tokens (skip prompt + special tokens like <|im_start|>)
     result.text = tokenizer_->decode({tokens.begin() + prompt_len, tokens.end()}, true);
+    
+    // Strip common training artifacts that some fine-tuned models emit at the start
+    for (const auto& prefix : {"user\n", "assistant\n"}) {
+        if (result.text.substr(0, std::strlen(prefix)) == prefix) {
+            result.text = result.text.substr(std::strlen(prefix));
+        }
+    }
+    // Strip any remaining leading whitespace/newlines
+    size_t text_start = result.text.find_first_not_of(" \n\r\t");
+    if (text_start != std::string::npos && text_start > 0) {
+        result.text = result.text.substr(text_start);
+    }
     result.tokens = tokens;
     
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -817,21 +532,9 @@ TokenID InferenceEngine::generate_next_token(
     const float* logits_data = logits.data_f32();
     std::memcpy(last_logits.data_f32(), logits_data, vocab_size * sizeof(float));
     
-    // DEBUG: Print top-5 logits at every position during first 20 tokens
-    if (start_pos < 20) {
-        const float* logit_ptr = last_logits.data_f32();
-        std::vector<std::pair<float, int>> top_logits;
-        for (int i = 0; i < vocab_size; i++) {
-            top_logits.push_back({logit_ptr[i], i});
-        }
-        std::partial_sort(top_logits.begin(), top_logits.begin() + 5, top_logits.end(),
-                         [](const auto& a, const auto& b) { return a.first > b.first; });
-        std::cout << "[Pos " << start_pos << "] Top-5 logits: ";
-        for (int i = 0; i < 5; i++) {
-            std::cout << top_logits[i].second << "(" << top_logits[i].first << ") ";
-        }
-        std::cout << std::endl;
-    }
+    // Apply repetition penalty before sampling
+    inference_utils::apply_repetition_penalty(last_logits, context,
+        sampling.repetition_penalty, sampling.repetition_penalty_range);
     
     // Sample token
     return sample_token(last_logits, sampling);
@@ -962,6 +665,24 @@ void apply_temperature(Tensor& logits, float temperature) {
     
     for (int i = 0; i < size; i++) {
         data[i] /= temperature;
+    }
+}
+
+void apply_repetition_penalty(Tensor& logits, const std::vector<TokenID>& context,
+                              float penalty, int range) {
+    if (penalty == 1.0f || context.empty()) return;
+    float* data = logits.data_f32();
+    int vocab_size = logits.num_elements();
+    
+    int start = std::max(0, static_cast<int>(context.size()) - range);
+    for (int i = start; i < static_cast<int>(context.size()); i++) {
+        TokenID token = context[i];
+        if (token < 0 || token >= vocab_size) continue;
+        // Standard repetition penalty: divide positive logits, multiply negative
+        if (data[token] > 0.0f)
+            data[token] /= penalty;
+        else
+            data[token] *= penalty;
     }
 }
 

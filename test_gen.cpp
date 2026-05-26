@@ -7,13 +7,13 @@ int main(int argc, char** argv) {
     using namespace ash;
     
     if (argc < 2) {
-        std::cerr << "Usage: test_gen <gguf_path>\n";
+        std::cerr << "Usage: test_gen <gguf_path> [prompt]\n";
         return 1;
     }
     
     std::string model_path = argv[1];
     
-    Logger::instance().set_min_level(LogLevel::INFO);  // Reduce spam
+    Logger::instance().set_min_level(LogLevel::INFO);
     
     std::cout << "Loading model...\n";
     InferenceEngine engine;
@@ -23,19 +23,22 @@ int main(int argc, char** argv) {
     }
     std::cout << "✅ Model loaded!\n\n";
     
-    // Test generation with greedy sampling
-    // Use Qwen2.5-Instruct chat template for sensible output
-    std::string prompt = "<|im_start|>system\nYou are ash-code:python, a specialized AI assistant focused on Python programming. You excel at writing clean, idiomatic Python code.<|im_end|>\n<|im_start|>user\nWrite a hello world in Python<|im_end|>\n<|im_start|>assistant\n";
-    std::cout << "Prompt: \"" << prompt << "\"\n\n";
+    // Use provided prompt or default
+    std::string user_input = (argc >= 3) ? argv[2] : "Write a hello world program";
+    std::string prompt =
+        "<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n"
+        "<|im_start|>user\n" + user_input + "<|im_end|>\n"
+        "<|im_start|>assistant\n";
     
+    std::cout << "Prompt: \"" << user_input << "\"\n\n";
     std::cout << "Generating...\n" << std::flush;
     
     SamplingConfig config;
-    config.max_tokens = 200;  // Give enough room to complete the answer
-    config.temperature = 0.0f;  // Greedy sampling
+    config.max_tokens = 200;
+    config.temperature = 0.0f;   // Greedy
     config.use_sampling = false;
+    config.repetition_penalty = 1.1f;  // Light penalty to prevent loops
     
-    std::cout << "Calling engine.generate()...\n" << std::flush;
     auto result = engine.generate(prompt, config);
     
     std::cout << "\nGenerated text:\n\"" << result.text << "\"\n";
@@ -44,3 +47,4 @@ int main(int argc, char** argv) {
     
     return 0;
 }
+

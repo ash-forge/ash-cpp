@@ -246,4 +246,66 @@ std::unordered_map<std::string, Tensor> SafeTensorsParser::load_all_tensors() {
     return tensors;
 }
 
+std::unordered_map<std::string, Tensor> SafeTensorsParser::load_all_tensors_fast() {
+    std::unordered_map<std::string, Tensor> result;
+    
+    if (!valid_) {
+        throw std::runtime_error("SafeTensorsParser not initialized");
+    }
+    
+    Logger::instance().info("Bulk-loading " + std::to_string(tensor_infos_.size()) + " tensors from: " + file_path_);
+    
+    // Sort tensors by file offset for sequential I/O
+    std::vector<const SafeTensorInfo*> ordered;
+    ordered.reserve(tensor_infos_.size());
+    for (const auto& info : tensor_infos_) {
+        ordered.push_back(&info);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+        [](const SafeTensorInfo* a, const SafeTensorInfo* b) {
+            return a->data_offset_start < b->data_offset_start;
+        });
+    
+    std::ifstream file(file_path_, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("Failed to open file: " + file_path_);
+    }
+    
+    for (const SafeTensorInfo* info : ordered) {
+        std::vector<int64_t> dims;
+        for (auto d : info->shape) dims.push_back(static_cast<int64_t>(d));
+        TensorShape shape(dims);
+        
+        bool is_bf16 = (info->dtype == "BF16");
+        size_t data_size = info->data_offset_end - info->data_offset_start;
+        uint64_t file_offset = data_offset_ + info->data_offset_start;
+        
+        file.seekg(file_offset);
+        
+        if (is_bf16) {
+            size_t num_elements = data_size / 2;
+            std::vector<uint16_t> bf16_data(num_elements);
+            file.read(reinterpret_cast<char*>(bf16_data.data()), data_size);
+            if (!file) throw std::runtime_error("Failed to read: " + info->name);
+            
+            Tensor tensor = Tensor::empty(shape, DType::F32);
+            float* f32_data = tensor.data_f32();
+            for (size_t i = 0; i < num_elements; i++) {
+                uint32_t bits = static_cast<uint32_t>(bf16_data[i]) << 16;
+                std::memcpy(&f32_data[i], &bits, sizeof(float));
+            }
+            result[info->name] = std::move(tensor);
+        } else {
+            DType dtype = dtype_from_string(info->dtype);
+            Tensor tensor = Tensor::empty(shape, dtype);
+            file.read(reinterpret_cast<char*>(tensor.data()), data_size);
+            if (!file) throw std::runtime_error("Failed to read: " + info->name);
+            result[info->name] = std::move(tensor);
+        }
+    }
+    
+    Logger::instance().info("✅ Bulk-loaded " + std::to_string(result.size()) + " tensors");
+    return result;
+}
+
 } // namespace ash

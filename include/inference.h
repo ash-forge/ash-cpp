@@ -46,6 +46,8 @@ struct SamplingConfig {
     int top_k = 40;             // Top-K sampling
     int max_tokens = 512;       // Max tokens to generate
     bool use_sampling = true;   // False = greedy (argmax)
+    float repetition_penalty = 1.0f;   // >1.0 penalizes recently seen tokens
+    int repetition_penalty_range = 64; // How many recent tokens to consider
     
     std::vector<TokenID> stop_tokens;  // Stop generation on these tokens
 };
@@ -102,6 +104,11 @@ public:
     // Load model from GGUF file
     bool load_model(const std::string& gguf_path);
     
+    // Load model weights from HuggingFace SafeTensors directory
+    // Reads config.json for architecture params; uses gguf_tokenizer_path for vocab
+    bool load_model_from_safetensors(const std::string& safetensors_dir,
+                                     const std::string& gguf_tokenizer_path);
+    
     // Check if model is loaded
     bool is_loaded() const { return weights_.loaded; }
     
@@ -155,6 +162,9 @@ private:
     // Load weights from GGUF parser
     bool load_weights_from_gguf(GGUFParser& parser);
     
+    // Load weights from SafeTensors shards (HF naming → internal)
+    bool load_weights_from_safetensors_dir(const std::string& dir);
+    
     // Forward pass through single layer
     Tensor forward_layer(
         const Tensor& x,
@@ -172,6 +182,10 @@ private:
 namespace inference_utils {
     // Apply temperature to logits
     void apply_temperature(Tensor& logits, float temperature);
+    
+    // Apply repetition penalty: divide logit of recently-seen tokens by penalty
+    void apply_repetition_penalty(Tensor& logits, const std::vector<TokenID>& context,
+                                  float penalty, int range = 64);
     
     // Get top-K indices
     std::vector<int> top_k_indices(const Tensor& logits, int k);

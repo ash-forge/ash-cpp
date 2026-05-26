@@ -30,8 +30,11 @@ DType gguf_type_to_dtype(GGUFTensorType gguf_type) {
 GGUFParser::GGUFParser() = default;
 GGUFParser::~GGUFParser() = default;
 
-// Maximum array elements to store — anything larger (e.g. vocabulary lists) is skipped
-static constexpr uint64_t MAX_STORED_ARRAY = 4096;
+// Maximum array elements to store.
+// Real model vocabularies can have up to ~1M tokens (Gemma: 256K, Qwen2: 152K, Llama: 32K).
+// Each stored GGUFMetadataValue is ~85 bytes, so 1M entries ≈ 85 MB — acceptable.
+// We still cap at 1M to guard against malformed files with absurd array lengths.
+static constexpr uint64_t MAX_STORED_ARRAY = 1'000'000;
 
 // Returns element byte width for fixed-width GGUF types, 0 for variable-width
 static size_t fixed_element_size(GGUFMetadataType type) {
@@ -464,22 +467,45 @@ std::unordered_map<std::string, Tensor> GGUFParser::load_all_tensors() {
 // Architecture-specific getters
 uint64_t GGUFParser::get_embedding_dim() const {
     std::string arch = get_architecture();
-    return get_uint(arch + ".embedding_length", 3072);
+    uint64_t val = get_uint(arch + ".embedding_length", 0);
+    if (val == 0) Logger::instance().error("GGUF: missing " + arch + ".embedding_length");
+    return val;
 }
 
 uint64_t GGUFParser::get_num_layers() const {
     std::string arch = get_architecture();
-    return get_uint(arch + ".block_count", 42);
+    uint64_t val = get_uint(arch + ".block_count", 0);
+    if (val == 0) Logger::instance().error("GGUF: missing " + arch + ".block_count");
+    return val;
 }
 
 uint64_t GGUFParser::get_num_heads() const {
     std::string arch = get_architecture();
-    return get_uint(arch + ".attention.head_count", 16);
+    uint64_t val = get_uint(arch + ".attention.head_count", 0);
+    if (val == 0) Logger::instance().error("GGUF: missing " + arch + ".attention.head_count");
+    return val;
 }
 
 uint64_t GGUFParser::get_num_kv_heads() const {
     std::string arch = get_architecture();
-    return get_uint(arch + ".attention.head_count_kv", 8);
+    // Some models (e.g. early Llama) don't specify kv_heads; fall back to n_heads (MHA, not GQA)
+    uint64_t n_heads = get_uint(arch + ".attention.head_count", 0);
+    return get_uint(arch + ".attention.head_count_kv", n_heads);
+}
+
+uint64_t GGUFParser::get_context_length() const {
+    std::string arch = get_architecture();
+    // GGUF stores context length as "{arch}.context_length" (e.g. llama.context_length)
+    // "general.context_length" is NOT a standard GGUF key — always check arch-prefixed first
+    uint64_t val = get_uint(arch + ".context_length", 0);
+    if (val == 0) {
+        val = get_uint("general.context_length", 0);
+    }
+    if (val == 0) {
+        Logger::instance().warning("GGUF: context_length not found, defaulting to 4096");
+        val = 4096;
+    }
+    return val;
 }
 
 uint64_t GGUFParser::get_vocab_size() const {

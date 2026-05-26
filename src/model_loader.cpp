@@ -331,7 +331,7 @@ struct ModelRegistry::Impl {
     std::unordered_map<std::string, std::unique_ptr<IModel>> models;
     std::unordered_map<std::string, ModelInfo> model_info;  // Metadata for all models
     std::unordered_map<std::string, time_t> last_used;       // LRU tracking
-    std::mutex mutex;
+    std::recursive_mutex mutex;
 };
 
 ModelRegistry& ModelRegistry::instance() {
@@ -345,14 +345,14 @@ ModelRegistry::~ModelRegistry() {
 }
 
 void ModelRegistry::register_model(const std::string& name, std::unique_ptr<IModel> model) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     impl_->models[name] = std::move(model);
     impl_->last_used[name] = std::time(nullptr);
     Logger::instance().info("Model registered: " + name);
 }
 
 IModel* ModelRegistry::get_model(const std::string& name) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     auto it = impl_->models.find(name);
     if (it != impl_->models.end()) {
         impl_->last_used[name] = std::time(nullptr);  // Update LRU
@@ -362,14 +362,14 @@ IModel* ModelRegistry::get_model(const std::string& name) {
 }
 
 void ModelRegistry::unload_model(const std::string& name) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     impl_->models.erase(name);
     impl_->last_used.erase(name);
     Logger::instance().info("Model unloaded: " + name);
 }
 
 void ModelRegistry::unload_all() {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     Logger::instance().info("Unloading all models (" +
         std::to_string(impl_->models.size()) + ")");
     impl_->models.clear();
@@ -377,7 +377,7 @@ void ModelRegistry::unload_all() {
 }
 
 std::vector<std::string> ModelRegistry::list_models() const {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     std::vector<std::string> names;
     for (const auto& [name, _] : impl_->models) {
         names.push_back(name);
@@ -386,7 +386,7 @@ std::vector<std::string> ModelRegistry::list_models() const {
 }
 
 size_t ModelRegistry::get_total_memory_usage() const {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     size_t total = 0;
     for (const auto& [_, model] : impl_->models) {
         total += model->get_memory_usage();
@@ -466,7 +466,7 @@ std::vector<ModelInfo> ModelRegistry::discover_models(const std::string& models_
 }
 
 bool ModelRegistry::load_model(const std::string& name, const std::string& file_path) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     
     // Check if already loaded
     if (impl_->models.count(name)) {
@@ -481,8 +481,14 @@ bool ModelRegistry::load_model(const std::string& name, const std::string& file_
         return false;
     }
     
-    // Get file size
-    size_t file_size = fs::file_size(file_path);
+    // Use cached size from discovery if available (avoids opening the file a second time)
+    size_t file_size = 0;
+    if (impl_->model_info.count(name)) {
+        file_size = impl_->model_info[name].file_size_bytes;
+    }
+    if (file_size == 0) {
+        file_size = fs::file_size(file_path);
+    }
     
     // Ensure space in budget
     if (!fits_in_budget(file_size)) {
@@ -525,12 +531,12 @@ bool ModelRegistry::load_model(const std::string& name, const std::string& file_
 }
 
 bool ModelRegistry::is_loaded(const std::string& name) const {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     return impl_->models.count(name) > 0;
 }
 
 ModelInfo ModelRegistry::get_model_info(const std::string& name) const {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     auto it = impl_->model_info.find(name);
     if (it != impl_->model_info.end()) {
         return it->second;
@@ -544,7 +550,7 @@ bool ModelRegistry::fits_in_budget(size_t additional_bytes) const {
 }
 
 void ModelRegistry::mark_model_used(const std::string& name) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     impl_->last_used[name] = std::time(nullptr);
     
     // Increment query count if we have model info
@@ -554,7 +560,7 @@ void ModelRegistry::mark_model_used(const std::string& name) {
 }
 
 std::string ModelRegistry::get_lru_model() const {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     
     if (impl_->last_used.empty()) {
         return "";
@@ -596,7 +602,7 @@ bool ModelRegistry::ensure_space(size_t required_bytes) {
 }
 
 void ModelRegistry::cleanup_cold_models(int max_age_seconds) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     
     time_t now = std::time(nullptr);
     std::vector<std::string> to_unload;

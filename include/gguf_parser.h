@@ -108,7 +108,7 @@ public:
     
     // Get model architecture info
     std::string get_architecture() const { return get_string("general.architecture"); }
-    uint64_t get_context_length() const { return get_uint("general.context_length", 8192); }
+    uint64_t get_context_length() const;
     uint64_t get_embedding_dim() const;
     uint64_t get_num_layers() const;
     uint64_t get_num_heads() const;

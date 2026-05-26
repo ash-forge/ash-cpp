@@ -58,10 +58,16 @@ public:
     Tensor load_tensor(const std::string& name);
     
     /**
-     * @brief Load all tensors from the file
+     * @brief Load all tensors from the file (one file open per tensor)
      * @return Map of tensor name to Tensor object
      */
     std::unordered_map<std::string, Tensor> load_all_tensors();
+
+    /**
+     * @brief Load all tensors in a single sequential pass (faster for bulk loads)
+     * @return Map of tensor name to Tensor object
+     */
+    std::unordered_map<std::string, Tensor> load_all_tensors_fast();
     
     /**
      * @brief Check if parser is valid (file was parsed successfully)
